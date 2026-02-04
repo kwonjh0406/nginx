@@ -1,36 +1,79 @@
-# This is a basic workflow to help you get started with Actions
+name: Nginx Deployment Pipeline (Private EC2 via SSM & ECR)
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+permissions:
+  contents: read
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  build-and-deploy:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      # --- [CD 영역 시작: AWS 자격 증명 설정] ---
+      # ECR 로그인 및 SSM 명령 실행을 위해 AWS 권한을 먼저 얻습니다.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: "${{ secrets.AWS_ACCESS_KEY }}"
+          aws-secret-access-key: "${{ secrets.AWS_SECRET_KEY }}"
+          aws-region: "${{ secrets.AWS_REGION }}"
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # --- [CD 영역: ECR 로그인] ---
+      # Docker Hub 대신 AWS ECR 창고에 접근하기 위해 로그인합니다.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # --- [CD 영역: 도커 이미지 생성 및 ECR 푸시] ---
+      - name: Build and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: "${{ secrets.AWS_ECR_REPOSITORY }}"
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          # 빌드 시 ECR 주소를 포함한 태그를 생성합니다.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          # 생성된 이미지를 ECR 창고로 푸시합니다.
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # --- [CD 영역: SSM을 통한 EC2 실 배포] ---
+      # Private EC2 내부망에 있는 에이전트에게 ECR 이미지를 배포하도록 명령합니다.
+      - name: Deploy to EC2 via SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: "${{ secrets.AWS_ECR_REPOSITORY }}"
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploying Nginx from ECR via SSM" \
+            --parameters '{
+              "commands": [
+                "# 1. EC2 내부에서 ECR 로그인 (12시간 유효한 임시 비밀번호 생성)",
+                "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin '"$ECR_REGISTRY"'",
+                
+                "# 2. 최신 이미지 가져오기 (ECR에서 이미지 Pull)",
+                "sudo docker pull '"$ECR_REGISTRY"'/'"$ECR_REPOSITORY"':'"$IMAGE_TAG"'",
+
+                "# 3. 기존 컨테이너 중지 및 삭제",
+                "sudo docker stop nginx-server || true",
+                "sudo docker rm nginx-server || true",
+
+                "# 4. 80번 포트로 실행 (ALB로부터의 트래픽을 수신)",
+                "sudo docker run -d --name nginx-server -p 80:80 '"$ECR_REGISTRY"'/'"$ECR_REPOSITORY"':'"$IMAGE_TAG"'",
+
+                "# 5. 오래된 이미지 정리",
+                "sudo docker image prune -f"
+              ]
+            }' \
+            --region ${{ secrets.AWS_REGION }}
