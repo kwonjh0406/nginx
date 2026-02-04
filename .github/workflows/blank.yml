@@ -1,9 +1,7 @@
-name: Nginx Deployment Pipeline (Private EC2 via SSM & ECR)
+name: Multi-Container Deployment (Nginx & FastAPI)
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
     branches: ["main"]
 
 permissions:
@@ -16,8 +14,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # --- [CD 영역 시작: AWS 자격 증명 설정] ---
-      # ECR 로그인 및 SSM 명령 실행을 위해 AWS 권한을 먼저 얻습니다.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -25,66 +21,62 @@ jobs:
           aws-secret-access-key: "${{ secrets.AWS_SECRET_KEY }}"
           aws-region: "${{ secrets.AWS_REGION }}"
 
-      # --- [CD 영역: ECR 로그인] ---
-      # Docker Hub 대신 AWS ECR 창고에 접근하기 위해 로그인합니다.
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # --- [CD 영역: 도커 이미지 생성 및 ECR 푸시] ---
-      - name: Build and push Docker image to ECR
+      - name: Build and push Docker images
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+          NGINX_REPO: ${{ secrets.AWS_ECR_REPOSITORY }}
+          FASTAPI_REPO: ${{ secrets.AWS_ECR_REPOSITORY_2 }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # 시크릿에 포함된 줄바꿈이나 공백을 완전히 제거합니다.
-          CLEAN_REPO=$(echo $ECR_REPOSITORY | tr -d '[:space:]')
-          FULL_IMAGE_NAME="$ECR_REGISTRY/$CLEAN_REPO"
+          # 변수 정제 (줄바꿈 제거)
+          CLEAN_NGINX=$(echo $NGINX_REPO | tr -d '[:space:]')
+          CLEAN_FASTAPI=$(echo $FASTAPI_REPO | tr -d '[:space:]')
           
-          echo "Building image: $FULL_IMAGE_NAME:$IMAGE_TAG"
+          # 1. FastAPI 빌드 및 푸시 (Repository 2)
+          docker build -t "$ECR_REGISTRY/$CLEAN_FASTAPI:$IMAGE_TAG" -t "$ECR_REGISTRY/$CLEAN_FASTAPI:latest" ./fastapi
+          docker push "$ECR_REGISTRY/$CLEAN_FASTAPI:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$CLEAN_FASTAPI:latest"
           
-          docker build -t "$FULL_IMAGE_NAME:$IMAGE_TAG" .
-          docker build -t "$FULL_IMAGE_NAME:latest" .
-          
-          docker push "$FULL_IMAGE_NAME:$IMAGE_TAG"
-          docker push "$FULL_IMAGE_NAME:latest"
+          # 2. Nginx 빌드 및 푸시 (Repository 1)
+          docker build -t "$ECR_REGISTRY/$CLEAN_NGINX:$IMAGE_TAG" -t "$ECR_REGISTRY/$CLEAN_NGINX:latest" .
+          docker push "$ECR_REGISTRY/$CLEAN_NGINX:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$CLEAN_NGINX:latest"
 
-      # --- [CD 영역: SSM을 통한 EC2 실 배포] ---
       - name: Deploy to EC2 via SSM
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+          NGINX_REPO: ${{ secrets.AWS_ECR_REPOSITORY }}
+          FASTAPI_REPO: ${{ secrets.AWS_ECR_REPOSITORY_2 }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # 여기서도 줄바꿈을 제거합니다.
-          CLEAN_REPO=$(echo $ECR_REPOSITORY | tr -d '[:space:]')
+          CLEAN_NGINX=$(echo $NGINX_REPO | tr -d '[:space:]')
+          CLEAN_FASTAPI=$(echo $FASTAPI_REPO | tr -d '[:space:]')
           
           aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploying Nginx from ECR via SSM" \
+            --comment "Deploying Nginx and FastAPI to separate repos" \
             --parameters "{
               \"commands\": [
                 \"aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin $ECR_REGISTRY\",
-                \"sudo docker pull $ECR_REGISTRY/$CLEAN_REPO:$IMAGE_TAG\",
+                
+                \"# 1. FastAPI 컨테이너 실행 (Repo 2)\",
+                \"sudo docker pull $ECR_REGISTRY/$CLEAN_FASTAPI:$IMAGE_TAG\",
+                \"sudo docker stop fastapi-app || true\",
+                \"sudo docker rm fastapi-app || true\",
+                \"sudo docker run -d --name fastapi-app -p 8000:8000 $ECR_REGISTRY/$CLEAN_FASTAPI:$IMAGE_TAG\",
+                
+                \"# 2. Nginx 컨테이너 실행 (Repo 1)\",
+                \"sudo docker pull $ECR_REGISTRY/$CLEAN_NGINX:$IMAGE_TAG\",
                 \"sudo docker stop nginx-server || true\",
                 \"sudo docker rm nginx-server || true\",
-                \"sudo docker run -d --name nginx-server -p 80:80 $ECR_REGISTRY/$CLEAN_REPO:$IMAGE_TAG\",
+                \"sudo docker run -d --name nginx-server -p 80:80 $ECR_REGISTRY/$CLEAN_NGINX:$IMAGE_TAG\",
+                
                 \"sudo docker image prune -f\"
               ]
             }" \
-            --region ${{ secrets.AWS_REGION }}
-
-                "# 3. 기존 컨테이너 중지 및 삭제",
-                "sudo docker stop nginx-server || true",
-                "sudo docker rm nginx-server || true",
-
-                "# 4. 80번 포트로 실행 (ALB로부터의 트래픽을 수신)",
-                "sudo docker run -d --name nginx-server -p 80:80 '"$ECR_REGISTRY"'/'"$ECR_REPOSITORY"':'"$IMAGE_TAG"'",
-
-                "# 5. 오래된 이미지 정리",
-                "sudo docker image prune -f"
-              ]
-            }' \
             --region ${{ secrets.AWS_REGION }}
