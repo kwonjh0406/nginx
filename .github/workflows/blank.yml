@@ -30,72 +30,53 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }} # IAM 사용자 비밀 키
           aws-region: ${{ secrets.AWS_REGION }} # 대상 AWS 리전 (예: ap-northeast-2)
 
-      # 3단계: 설정 파일과 HTML 정적 자산을 S3 버킷에 업로드합니다.
-      - name: Upload Config and Assets to S3
-        run: |
-          # default.conf 파일을 S3의 config 폴더로 복사합니다.
-          aws s3 cp ./default.conf s3://${{ secrets.AWS_S3_BUCKET }}/config/default.conf
-          # index.html 파일을 S3의 html 폴더로 복사합니다. (현재 루트에 위치하므로 단일 파일 업로드)
-          aws s3 cp ./index.html s3://${{ secrets.AWS_S3_BUCKET }}/html/index.html
-
-      # 4단계: Docker 이미지를 저장할 ECR 리포지토리에 로그인합니다.
+      # 3단계: Docker 이미지를 저장할 ECR 리포지토리에 로그인합니다.
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 5단계: Docker 이미지를 빌드하고 ECR에 업로드(Push)합니다.
+      # 4단계: Docker 이미지를 빌드하고 ECR에 업로드(Push)합니다.
       - name: Build and push Docker image to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Dockerfile을 기반으로 이미지를 빌드합니다.
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
-          # 빌드된 이미지들을 AWS ECR로 전송합니다.
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          FULL_IMAGE_NAME="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          
+          # Dockerfile 내부에 default.conf와 index.html이 포함되도록 빌드합니다.
+          docker build -t "${FULL_IMAGE_NAME}:${IMAGE_TAG}" .
+          docker build -t "${FULL_IMAGE_NAME}:latest" .
+          
+          docker push "${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+          docker push "${FULL_IMAGE_NAME}:latest"
 
-      # 6단계: AWS SSM을 통해 Auto Scaling Group의 인스턴스들에 배포 명령을 내립니다.
+      # 5단계: AWS SSM을 통해 Auto Scaling Group의 인스턴스들에 배포 명령을 내립니다.
       - name: Deploy to ASG via SSM
         run: |
-          # 1. 배포에 필요한 변수들을 정리합니다.
           REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           REPO="${{ secrets.AWS_ECR_REPOSITORY }}"
           TAG="${{ github.sha }}"
           FULL_IMAGE="$REGISTRY/$REPO:$TAG"
 
-          # 2. SSM Send-Command: ASG 태그를 기반으로 모든 인스턴스에 명령을 전달합니다.
-          # --targets 옵션을 사용하여 특정 ASG에 속한 인스턴스들을 대상으로 지정합니다.
           aws ssm send-command \
             --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploying Nginx to ASG via GitHub Actions" \
+            --comment "Deploying Nginx to ASG via GitHub Actions (S3-less)" \
             --region ${{ secrets.AWS_REGION }} \
             --parameters "{
               \"commands\": [
-                \"# EC2 내부: 앱 디렉토리 준비\",
-                \"sudo mkdir -p /home/ec2-user/app/html\",
-                
-                \"# EC2 내부: S3에서 구성 파일 및 정적 파일 다운로드\",
-                \"aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/config/default.conf /home/ec2-user/app/default.conf\",
-                \"aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/html/index.html /home/ec2-user/app/html/index.html\",
-                
-                \"# EC2 내부: ECR 로그인\",
+                \"# ECR 로그인\",
                 \"aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin $REGISTRY\",
                 
-                \"# EC2 내부: 최신 이미지 가져오기 및 실행\",
+                \"# 최신 이미지 가져오기 및 실행 (이미지 안에 설정이 모두 포함됨)\",
                 \"sudo docker pull $FULL_IMAGE\",
                 \"sudo docker stop nginx-server || true\",
                 \"sudo docker rm nginx-server || true\",
                 
-                \"sudo docker run -d --name nginx-server -p 80:80 \
-                  -v /home/ec2-user/app/default.conf:/etc/nginx/conf.d/default.conf \
-                  -v /home/ec2-user/app/html:/usr/share/nginx/html \
-                  $FULL_IMAGE\",
+                \"sudo docker run -d --name nginx-server -p 80:80 $FULL_IMAGE\",
                 
-                \"# EC2 내부: 리소스 정리\",
+                \"# 리소스 정리\",
                 \"sudo docker image prune -f\"
               ]
             }"
