@@ -1,82 +1,33 @@
-# 워크플로우의 이름입니다. GitHub Actions 탭에서 이 이름으로 표시됩니다.
-name: Nginx-Deployment-Pipeline
+name: Build and Push to ECR
 
-# 트리거 설정: 어떤 이벤트가 발생했을 때 이 파이프라인을 실행할지 결정합니다.
 on:
   push:
-    branches: ["main"] # main 브랜치에 코드가 push될 때 실행
-  pull_request:
-    branches: ["main"] # main 브랜치로 PR이 생성될 때 실행
-
-# 권한 설정: GitHub Actions 러너가 리포지토리의 코드를 읽을 수 있도록 허용합니다.
-permissions:
-  contents: read
+    branches: ["main"]
 
 jobs:
-  # 작업의 이름입니다.
-  build-and-deploy:
-    runs-on: ubuntu-latest # 최신 Ubuntu 환경의 가상 머신에서 실행됩니다.
-
+  deploy:
+    runs-on: ubuntu-latest
     steps:
-      # 1단계: 리포지토리에 올린 코드를 가상 머신으로 가져옵니다.
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2단계: AWS 명령을 실행하기 위해 자격 증명을 설정합니다.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }} # IAM 사용자 액세스 키
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }} # IAM 사용자 비밀 키
-          aws-region: ${{ secrets.AWS_REGION }} # 대상 AWS 리전 (예: ap-northeast-2)
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
 
-      # 3단계: Docker 이미지를 저장할 ECR 리포지토리에 로그인합니다.
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 4단계: Docker 이미지를 빌드하고 ECR에 업로드(Push)합니다.
-      - name: Build and push Docker image to ECR
+      - name: Build & Push Nginx
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          FULL_IMAGE_NAME="${ECR_REGISTRY}/${ECR_REPOSITORY}"
-          
-          # Dockerfile 내부에 default.conf와 index.html이 포함되도록 빌드합니다.
-          docker build -t "${FULL_IMAGE_NAME}:${IMAGE_TAG}" .
-          docker build -t "${FULL_IMAGE_NAME}:latest" .
-          
-          docker push "${FULL_IMAGE_NAME}:${IMAGE_TAG}"
-          docker push "${FULL_IMAGE_NAME}:latest"
-
-      # 5단계: AWS SSM을 통해 Auto Scaling Group의 인스턴스들에 배포 명령을 내립니다.
-      - name: Deploy to ASG via SSM
-        run: |
-          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          REPO="${{ secrets.AWS_ECR_REPOSITORY }}"
-          TAG="${{ github.sha }}"
-          FULL_IMAGE="$REGISTRY/$REPO:$TAG"
-
-          aws ssm send-command \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.ASG_NAME }}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploying Nginx to ASG via GitHub Actions (S3-less)" \
-            --region ${{ secrets.AWS_REGION }} \
-            --parameters "{
-              \"commands\": [
-                \"# ECR 로그인\",
-                \"aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin $REGISTRY\",
-                
-                \"# 최신 이미지 가져오기 및 실행 (이미지 안에 설정이 모두 포함됨)\",
-                \"sudo docker pull $FULL_IMAGE\",
-                \"sudo docker stop nginx-server || true\",
-                \"sudo docker rm nginx-server || true\",
-                
-                \"sudo docker run -d --name nginx-server -p 80:80 $FULL_IMAGE\",
-                
-                \"# 리소스 정리\",
-                \"sudo docker image prune -f\"
-              ]
-            }"
+          docker build -t $ECR_REGISTRY/kwonjh0406/nginx:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/kwonjh0406/nginx:$IMAGE_TAG $ECR_REGISTRY/kwonjh0406/nginx:latest
+          docker push $ECR_REGISTRY/kwonjh0406/nginx:$IMAGE_TAG
+          docker push $ECR_REGISTRY/kwonjh0406/nginx:latest
