@@ -1,0 +1,111 @@
+# ####################################################################################################
+# IV. 애플리케이션 배포: Nginx 웹서버 + FastAPI (로드밸런서 포함)
+# ====================================================================================================
+# 1. Service: 외부에서 접속 가능한 로드밸런서(대문) 정의 : web-deployment.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-project-svc # 서비스 이름
+spec:
+  type: NodePort # ALB는 NodePort 서비스를 바라보고 트래픽을 넘깁니다.
+  selector:
+    app: web-project # 위에서 만든 nginx 라벨을 가진 파드들로 트래픽을 전달
+  ports:
+    - name: http # [리스너 1] 이름 지정 (포트가 여러 개일 땐 필수)
+      protocol: TCP
+      port: 80 # 로드밸런서가 외부에서 받는 포트
+      targetPort: 80 # 실제 파드로 전달되는 포트
+    - name: custom-port # [리스너 2] 추가된 리스너
+      protocol: TCP
+      port: 8000 # 외부에서 8080으로 접속하면
+      targetPort: 8000 # 파드의 80번으로 전달 (포트 포워딩 역할)
+---
+# 2. Ingress를 통해 ALB를 생성합니다
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-project-svc
+  annotations:
+    # ALB 클래스 지정 (최신 방식은 spec.ingressClassName을 쓰지만 annotation도 작동함)
+    kubernetes.io/ingress.class: alb
+
+    # 외부 노출 및 타겟 설정
+    alb.ingress.kubernetes.io/scheme: internet-facing # internet-facing(외부공개)/internal(내부)
+    alb.ingress.kubernetes.io/target-type: instance # instance 또는 ip(파드 직접 지정, VPC CNI환경이 완벽해야 함)
+
+    # 보안 그룹
+    # alb.ingress.kubernetes.io/security-groups: sg-0dab199d320638d6a
+
+    # 4. 헬스체크 설정
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+
+    # 기타 속성 (ALB 전용 표기법)
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60
+
+    # ALB가 여러 포트를 관리할 때 필요한 설정
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTP": 8000}]'
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-project-svc # 서비스 이름과 일치해야 함
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: web-project-svc # 서비스 이름과 일치해야 함
+                port:
+                  number: 8000
+---
+# ---------------------------------------------------------
+# 2. Deployment: 애플리케이션(Nginx) 컨테이너 실행 정의
+# ---------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-deployment # 이 배포의 이름
+spec:
+  replicas: 2 # [요청 개수] 처음에 띄울 파드의 개수 (요청하신 2개)
+  selector:
+    matchLabels:
+      app: web-project # 이 라벨이 붙은 파드들을 관리하겠다는 선언
+  template:
+    metadata:
+      labels:
+        app: web-project # 생성될 파드에 부여할 라벨 (위의 selector와 일치해야 함)
+    spec:
+      containers:
+        # 1번 컨테이너: Nginx (웹서버 역할)
+        - name: nginx
+          image: nginx:latest
+          ports:
+            - containerPort: 80 # 컨테이너 안에서 Nginx가 사용하는 포트
+          resources: # [중요] HPA가 CPU 사용량을 계산하기 위한 기준 설정
+            requests:
+              cpu: "100m" # [예약] "최소한 이만큼은 보장해줘" (스케줄링 기준)
+              memory: "128Mi"
+            limits:
+              cpu: "250m" # [한계] "아무리 바빠도 0.5코어 이상은 쓰지마" (강제 제한)
+              memory: "256Mi"
+
+        # 2번 컨테이너: FastAPI (Application 역할)
+        - name: fastapi
+          image: python:3.9-slim
+          command: ["python", "-m", "http.server", "8000"]
+          ports:
+            - containerPort: 8000 # FastAPI가 사용하는 포트
+          resources:
+            requests:
+              cpu: "100m" # [예약] "최소한 이만큼은 보장해줘" (스케줄링 기준)
+              memory: "128Mi"
+            limits:
+              cpu: "500m" # [한계] "아무리 바빠도 0.5코어 이상은 쓰지마" (강제 제한)
+              memory: "256Mi"
