@@ -28,5 +28,4 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t 036333380579.dkr.ecr.ap-northeast-1.amazonaws.com/kwonjh0406/nginx:$IMAGE_TAG .
-          docker tag 036333380579.dkr.ecr.ap-northeast-1.amazonaws.com/kwonjh0406/nginx:$IMAGE_TAG
           docker push 036333380579.dkr.ecr.ap-northeast-1.amazonaws.com/kwonjh0406/nginx:$IMAGE_TAG
