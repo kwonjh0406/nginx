@@ -1,0 +1,86 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: ["main"]
+
+# 동일한 워크플로우가 동시에 돌 때 충돌을 방지합니다. (새 작업이 들어오면 이전 작업 취소)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # Git 로그를 모두 가져와야 push 시 충돌 에러를 줄여줍니다.
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Nginx
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/csjin/nginx:$IMAGE_TAG ./nginx
+          docker push $ECR_REGISTRY/csjin/nginx:$IMAGE_TAG
+
+          # docker tag $ECR_REGISTRY/csjin/nginx:$IMAGE_TAG $ECR_REGISTRY/csjin/nginx:latest
+          # docker push $ECR_REGISTRY/csjin/nginx:latest
+
+      - name: Build & Push FastAPI
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/csjin/fastapi:$IMAGE_TAG ./fastapi
+          docker push $ECR_REGISTRY/csjin/fastapi:$IMAGE_TAG
+
+          # latest 태그도 같이 푸시 (ArgoCD 연결 전 테스트용)
+          # docker tag $ECR_REGISTRY/csjin/fastapi:$IMAGE_TAG $ECR_REGISTRY/csjin/fastapi:latest
+          # docker push $ECR_REGISTRY/csjin/fastapi:latest
+
+      # ==========================================================
+      # 핵심 추가 단계: k8s 폴더의 YAML 파일을 수정하여 ArgoCD에게 배포를 지시합니다.
+      # ==========================================================
+      - name: Update K8s Manifests (ArgoCD Trigger)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # k8s 폴더 내의 모든 .yaml과 .yml 파일을 찾아서 이미지 업데이트 (에러 방지를 위해 || true 추가)
+          # 이 명령어는 파일이 없어도 에러를 내지 않고 다음으로 넘어갑니다.
+          find k8s -name "*.y*ml" -exec sed -i "s|image: $ECR_REGISTRY/csjin/fastapi:.*|image: $ECR_REGISTRY/csjin/fastapi:$IMAGE_TAG|g" {} +
+          find k8s -name "*.y*ml" -exec sed -i "s|image: $ECR_REGISTRY/csjin/nginx:.*|image: $ECR_REGISTRY/csjin/nginx:$IMAGE_TAG|g" {} +
+
+          # 변경된 사항이 있을 때만 Git 작업을 진행합니다.
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+
+          # 변경된 yaml 파일들만 스테이징
+          git add k8s/*.y*ml || echo "No files to add"
+
+          # 변경 사항이 있는지 확인 후 커밋 (변경 사항 없으면 건너뜀)
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            # [skip ci]를 넣어 자동화 커밋이 다시 Action을 실행시키지 않게 합니다.
+            git commit -m "Auto-deploy: update image tags [skip ci]"
+
+            # 다른 작업과 충돌 방지를 위해 pull 후 push 합니다.
+            git pull --rebase origin main
+            git push origin main
+          fi
