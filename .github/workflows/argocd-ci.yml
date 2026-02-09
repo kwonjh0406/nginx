@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
 
+permissions:
+  contents: write   # 👈 이 줄 추가 (여기가 핵심)
+
 # 동일한 워크플로우가 동시에 돌 때 충돌을 방지합니다. (새 작업이 들어오면 이전 작업 취소)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
